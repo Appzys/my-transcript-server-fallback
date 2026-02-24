@@ -18,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------- PROXY HELPERS ---------- #
+# -------- PROXY HELPERS -------- #
 
 def scrape_get(url):
     proxy_url = f"http://api.scrape.do/?token={SCRAPE_TOKEN}&url={url}"
@@ -27,21 +27,10 @@ def scrape_get(url):
 
 def scrape_post(url, payload):
     proxy_url = f"http://api.scrape.do/?token={SCRAPE_TOKEN}&url={url}"
+    headers = {"Content-Type": "application/json"}
+    return requests.post(proxy_url, data=json.dumps(payload), headers=headers, timeout=25)
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-
-    # IMPORTANT: send raw JSON string, not json=
-    return requests.post(
-        proxy_url,
-        data=json.dumps(payload),
-        headers=headers,
-        timeout=25
-    )
-
-# ----------------------------------- #
+# -------------------------------- #
 
 
 @app.route("/")
@@ -56,7 +45,6 @@ def get_transcript():
 
     client_key = request.headers.get("X-API-KEY")
     if client_key != API_KEY:
-        logger.warning(f"[{request_id}] UNAUTHORIZED")
         return jsonify({"success": False, "error": "Unauthorized"}), 401
 
     video_id = (
@@ -66,7 +54,6 @@ def get_transcript():
     )
 
     if not video_id:
-        logger.warning(f"[{request_id}] MISSING_VIDEO_ID")
         return jsonify({
             "success": False,
             "error": "Missing parameter. Use /transcript?id=VIDEO_ID"
@@ -75,27 +62,22 @@ def get_transcript():
     try:
         logger.info(f"[{request_id}] START video={video_id}")
 
-        # ---------------- WATCH PAGE ---------------- #
+        # ---- WATCH PAGE ---- #
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
         watch_resp = scrape_get(watch_url)
 
-        logger.info(f"[{request_id}] WATCH_STATUS={watch_resp.status_code}")
-
         if watch_resp.status_code != 200:
-            logger.error(f"[{request_id}] WATCH_BODY={watch_resp.text[:400]}")
             raise Exception("WATCH_FETCH_FAILED")
 
         html = watch_resp.text
 
         key_match = re.search(r'"INNERTUBE_API_KEY":"(.*?)"', html)
         if not key_match:
-            logger.error(f"[{request_id}] INNERTUBE_KEY_NOT_FOUND")
             raise Exception("INNERTUBE_KEY_NOT_FOUND")
 
         innertube_key = key_match.group(1)
-        logger.info(f"[{request_id}] INNERTUBE_KEY_EXTRACTED")
 
-        # ---------------- PLAYER API ---------------- #
+        # ---- PLAYER API ---- #
         player_url = f"https://youtubei.googleapis.com/youtubei/v1/player?key={innertube_key}"
 
         payload = {
@@ -111,36 +93,19 @@ def get_transcript():
 
         player_resp = scrape_post(player_url, payload)
 
-        logger.info(f"[{request_id}] PLAYER_STATUS={player_resp.status_code}")
-
         if player_resp.status_code != 200:
-            logger.error(f"[{request_id}] PLAYER_BODY={player_resp.text[:400]}")
             raise Exception("PLAYER_FETCH_FAILED")
 
-        try:
-            player_json = player_resp.json()
-        except Exception:
-            logger.error(f"[{request_id}] PLAYER_JSON_PARSE_ERROR")
-            logger.error(player_resp.text[:400])
-            raise Exception("INVALID_PLAYER_JSON")
+        player_json = player_resp.json()
 
         playability = player_json.get("playabilityStatus", {})
-        status = playability.get("status")
-
-        logger.info(f"[{request_id}] PLAYABILITY={status}")
-
-        if status == "LOGIN_REQUIRED":
-            logger.error(f"[{request_id}] LOGIN_REQUIRED")
+        if playability.get("status") == "LOGIN_REQUIRED":
             return jsonify({"success": False, "error": "LOGIN_REQUIRED"}), 500
 
         if "captions" not in player_json:
-            logger.error(f"[{request_id}] NO_CAPTIONS_FIELD")
-            logger.error(json.dumps(player_json)[:400])
             return jsonify({"success": False, "error": "Transcript not available"}), 404
 
         tracks = player_json["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"]
-
-        logger.info(f"[{request_id}] TRACK_COUNT={len(tracks)}")
 
         selected = None
         for t in tracks:
@@ -148,28 +113,24 @@ def get_transcript():
                 selected = t
                 break
 
-        if selected is None and tracks:
+        if selected is None:
             selected = tracks[0]
-
-        if not selected:
-            raise Exception("NO_TRACK_SELECTED")
 
         caption_url = selected["baseUrl"]
         lang = selected.get("languageCode", "unknown")
 
-        # ---------------- CAPTION XML ---------------- #
+        # ---- CAPTION XML ---- #
         xml_resp = scrape_get(caption_url)
 
-        logger.info(f"[{request_id}] XML_STATUS={xml_resp.status_code}")
-
         if xml_resp.status_code != 200:
-            logger.error(f"[{request_id}] XML_BODY={xml_resp.text[:400]}")
             raise Exception("CAPTION_FETCH_FAILED")
 
         root = ET.fromstring(xml_resp.text)
 
         subtitles = []
+        format_used = "text"
 
+        # -------- NORMAL FORMAT -------- #
         for node in root.iter("text"):
             subtitles.append({
                 "text": (node.text or "").replace("\n", " ").strip(),
@@ -178,7 +139,26 @@ def get_transcript():
                 "language": lang
             })
 
-        logger.info(f"[{request_id}] SUCCESS count={len(subtitles)}")
+        # -------- SRV3 FALLBACK -------- #
+        if len(subtitles) == 0:
+            format_used = "srv3"
+
+            for node in root.iter("p"):
+                chunks = []
+                for s in node.iter("s"):
+                    if s.text:
+                        chunks.append(s.text.strip())
+
+                text_value = " ".join(chunks) if chunks else (node.text or "").strip()
+
+                subtitles.append({
+                    "text": text_value,
+                    "start": float(node.attrib.get("t", 0)) / 1000,
+                    "duration": float(node.attrib.get("d", 0)) / 1000,
+                    "language": lang
+                })
+
+        logger.info(f"[{request_id}] SUCCESS count={len(subtitles)} format={format_used}")
 
         return Response(
             json.dumps({
@@ -186,7 +166,7 @@ def get_transcript():
                 "mode": "SCRAPE_PROXY",
                 "count": len(subtitles),
                 "lang": lang,
-                "format": "manual",
+                "format": format_used,
                 "subtitles": subtitles
             }, ensure_ascii=False),
             mimetype="application/json"
