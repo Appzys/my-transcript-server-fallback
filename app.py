@@ -18,19 +18,33 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# -------- PROXY HELPERS -------- #
+# ---------------- PROXY HELPERS ---------------- #
 
-def scrape_get(url):
+def scrape_get(url, request_id):
     proxy_url = f"http://api.scrape.do/?token={SCRAPE_TOKEN}&url={url}"
-    return requests.get(proxy_url, timeout=25)
+    logger.info(f"[{request_id}] PROXY_GET → {url}")
+    resp = requests.get(proxy_url, timeout=25)
+    logger.info(f"[{request_id}] PROXY_GET_STATUS={resp.status_code}")
+    return resp
 
 
-def scrape_post(url, payload):
+def scrape_post(url, payload, request_id):
     proxy_url = f"http://api.scrape.do/?token={SCRAPE_TOKEN}&url={url}"
     headers = {"Content-Type": "application/json"}
-    return requests.post(proxy_url, data=json.dumps(payload), headers=headers, timeout=25)
 
-# -------------------------------- #
+    logger.info(f"[{request_id}] PROXY_POST → {url}")
+
+    resp = requests.post(
+        proxy_url,
+        data=json.dumps(payload),
+        headers=headers,
+        timeout=25
+    )
+
+    logger.info(f"[{request_id}] PROXY_POST_STATUS={resp.status_code}")
+    return resp
+
+# ------------------------------------------------ #
 
 
 @app.route("/")
@@ -43,41 +57,47 @@ def get_transcript():
 
     request_id = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
 
-    client_key = request.headers.get("X-API-KEY")
-    if client_key != API_KEY:
-        return jsonify({"success": False, "error": "Unauthorized"}), 401
-
-    video_id = (
-        request.args.get("id")
-        or request.args.get("v")
-        or request.args.get("video_id")
-    )
-
-    if not video_id:
-        return jsonify({
-            "success": False,
-            "error": "Missing parameter. Use /transcript?id=VIDEO_ID"
-        }), 400
-
     try:
+
+        client_key = request.headers.get("X-API-KEY")
+        if client_key != API_KEY:
+            logger.warning(f"[{request_id}] UNAUTHORIZED")
+            return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+        video_id = (
+            request.args.get("id")
+            or request.args.get("v")
+            or request.args.get("video_id")
+        )
+
+        if not video_id:
+            logger.warning(f"[{request_id}] MISSING_VIDEO_ID")
+            return jsonify({
+                "success": False,
+                "error": "Missing parameter. Use /transcript?id=VIDEO_ID"
+            }), 400
+
         logger.info(f"[{request_id}] START video={video_id}")
 
-        # ---- WATCH PAGE ---- #
+        # ---------- WATCH PAGE ---------- #
         watch_url = f"https://www.youtube.com/watch?v={video_id}"
-        watch_resp = scrape_get(watch_url)
+        watch_resp = scrape_get(watch_url, request_id)
 
         if watch_resp.status_code != 200:
+            logger.error(f"[{request_id}] WATCH_FETCH_FAILED_BODY={watch_resp.text[:400]}")
             raise Exception("WATCH_FETCH_FAILED")
 
         html = watch_resp.text
 
         key_match = re.search(r'"INNERTUBE_API_KEY":"(.*?)"', html)
         if not key_match:
+            logger.error(f"[{request_id}] INNERTUBE_KEY_NOT_FOUND")
             raise Exception("INNERTUBE_KEY_NOT_FOUND")
 
         innertube_key = key_match.group(1)
+        logger.info(f"[{request_id}] INNERTUBE_KEY_EXTRACTED")
 
-        # ---- PLAYER API ---- #
+        # ---------- PLAYER API ---------- #
         player_url = f"https://youtubei.googleapis.com/youtubei/v1/player?key={innertube_key}"
 
         payload = {
@@ -91,21 +111,42 @@ def get_transcript():
             "videoId": video_id
         }
 
-        player_resp = scrape_post(player_url, payload)
+        player_resp = scrape_post(player_url, payload, request_id)
 
         if player_resp.status_code != 200:
+            logger.error(f"[{request_id}] PLAYER_FETCH_FAILED_BODY={player_resp.text[:400]}")
             raise Exception("PLAYER_FETCH_FAILED")
 
-        player_json = player_resp.json()
+        try:
+            player_json = player_resp.json()
+        except Exception as parse_err:
+            logger.error(f"[{request_id}] PLAYER_JSON_PARSE_ERROR={str(parse_err)}")
+            logger.error(player_resp.text[:400])
+            raise Exception("INVALID_PLAYER_JSON")
 
         playability = player_json.get("playabilityStatus", {})
-        if playability.get("status") == "LOGIN_REQUIRED":
+        status = playability.get("status")
+
+        logger.info(f"[{request_id}] PLAYABILITY_STATUS={status}")
+
+        if status == "LOGIN_REQUIRED":
+            logger.error(f"[{request_id}] LOGIN_REQUIRED_BLOCK")
             return jsonify({"success": False, "error": "LOGIN_REQUIRED"}), 500
 
+        if status not in ["OK", None]:
+            logger.warning(f"[{request_id}] PLAYABILITY_WARNING={playability}")
+
         if "captions" not in player_json:
+            logger.error(f"[{request_id}] NO_CAPTIONS_FIELD")
+            logger.error(json.dumps(player_json)[:400])
             return jsonify({"success": False, "error": "Transcript not available"}), 404
 
         tracks = player_json["captions"]["playerCaptionsTracklistRenderer"]["captionTracks"]
+        logger.info(f"[{request_id}] TRACK_COUNT={len(tracks)}")
+
+        if not tracks:
+            logger.error(f"[{request_id}] EMPTY_TRACKS")
+            return jsonify({"success": False, "error": "No tracks found"}), 404
 
         selected = None
         for t in tracks:
@@ -119,18 +160,26 @@ def get_transcript():
         caption_url = selected["baseUrl"]
         lang = selected.get("languageCode", "unknown")
 
-        # ---- CAPTION XML ---- #
-        xml_resp = scrape_get(caption_url)
+        logger.info(f"[{request_id}] SELECTED_LANG={lang}")
+
+        # ---------- CAPTION XML ---------- #
+        xml_resp = scrape_get(caption_url, request_id)
 
         if xml_resp.status_code != 200:
+            logger.error(f"[{request_id}] CAPTION_FETCH_FAILED_BODY={xml_resp.text[:400]}")
             raise Exception("CAPTION_FETCH_FAILED")
 
-        root = ET.fromstring(xml_resp.text)
+        try:
+            root = ET.fromstring(xml_resp.text)
+        except Exception as xml_err:
+            logger.error(f"[{request_id}] XML_PARSE_ERROR={str(xml_err)}")
+            logger.error(xml_resp.text[:400])
+            raise Exception("INVALID_XML")
 
         subtitles = []
         format_used = "text"
 
-        # -------- NORMAL FORMAT -------- #
+        # NORMAL FORMAT
         for node in root.iter("text"):
             subtitles.append({
                 "text": (node.text or "").replace("\n", " ").strip(),
@@ -139,9 +188,10 @@ def get_transcript():
                 "language": lang
             })
 
-        # -------- SRV3 FALLBACK -------- #
+        # SRV3 FALLBACK
         if len(subtitles) == 0:
             format_used = "srv3"
+            logger.info(f"[{request_id}] SRV3_FALLBACK_TRIGGERED")
 
             for node in root.iter("p"):
                 chunks = []
@@ -173,7 +223,7 @@ def get_transcript():
         )
 
     except Exception as e:
-        logger.error(f"[{request_id}] ERROR={type(e).__name__} video={video_id}")
+        logger.error(f"[{request_id}] UNHANDLED_ERROR type={type(e).__name__} message={str(e)}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
